@@ -906,6 +906,155 @@ class TestMaterializedViews(Tester):
                 cl=ConsistencyLevel.ALL
             )
 
+    def view_tombstone_test_by_update(self):
+        """
+        Add mote tests that a materialized views properly tombstone via update query
+
+        @jira_ticket CASSANDRA-13409
+        """
+        session = self.prepare(rf=1, nodes=1, options={'hinted_handoff_enabled': False})
+        node1 = self.cluster.nodelist()[0]
+
+        session.execute('USE ks')
+
+        session.execute("CREATE TABLE t (id int PRIMARY KEY, v int, v2 text, v3 decimal)")
+        session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
+                         "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v,id)"))
+
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        # Set initial values TS=1, verify
+        session.execute(SimpleStatement("INSERT INTO t (id, v, v2, v3) VALUES (1, 1, 'a', 3.0) USING TIMESTAMP 1"))
+        self._replay_batchlogs()
+
+        # flush it, so when reading, shallowable tombstones will be reconciled
+        node1.flush()
+        assert_one(
+            session,
+            "SELECT * FROM t_by_v WHERE v = 1",
+            [1, 1, 'a', 3.0]
+        )
+        # change v's value and TS=2, tombstones v=1 and adds v=0 record
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 2 SET v = 0 WHERE id = 1;"))
+        self._replay_batchlogs()
+        node1.flush()
+        assert_one(
+            session,
+            "SELECT * FROM t_by_v",
+            [0, 1, 'a', 3.0]
+        )
+
+        # tombstones of mv created by base upsert should be shallowed by new updates
+        # change v's value back and TS=3, tombstones v=0 and adds v=1 record
+        session.execute(SimpleStatement("UPDATE t USING TIMESTAMP 3 SET v = 1 WHERE id = 1;"))
+        self._replay_batchlogs()
+        node1.flush()
+        assert_one(
+            session,
+            "SELECT * FROM t_by_v",
+            [1, 1, 'a', 3.0]
+        )
+
+    @since('4.0')
+    def view_tombstone_test_by_delete(self):
+        """
+        Add mote tests that a materialized views properly tombstone via delete query.
+        Able to shadow view row even if it has column with ts greater than view pk,
+        and able to re-insert the view row when base column used in view pk is modified.
+
+        @jira_ticket CASSANDRA-13409
+        """
+        session = self.prepare(rf=1, nodes=1, options={'hinted_handoff_enabled': False})
+        node1 = self.cluster.nodelist()[0]
+
+        session.execute('USE ks')
+
+        session.execute("CREATE TABLE t (id int PRIMARY KEY, v int, v2 text, v3 decimal)")
+        session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
+                         "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v,id)"))
+
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        # Set initial values TS=1
+        session.execute(SimpleStatement("INSERT INTO t (id, v, v2, v3) VALUES (1, 1, 'a', 3.0) USING TIMESTAMP 1"))
+        self._replay_batchlogs()
+
+        # flush it, so when reading, shallowable tombstones will be reconciled
+        node1.flush()
+        assert_one(
+            session,
+            "SELECT * FROM t_by_v",
+            [1, 1, 'a', 3.0]
+        )
+
+        # change v's value and TS=2, tombstones v=1 and adds v=0 record
+        session.execute(SimpleStatement("DELETE FROM t USING TIMESTAMP 2 WHERE id = 1;"))
+        self._replay_batchlogs()
+        node1.flush()
+        assert_none(
+            session,
+            "SELECT * FROM t_by_v"
+        )
+
+        assert_none(
+            session,
+            "SELECT * FROM t"
+        )
+
+        # tombstones of mv created by base deletion should not be shadowed by new updates
+        # change v's value back and TS=3, tombstones v=0 and adds v=1 record
+        session.execute(SimpleStatement("INSERT INTO t (id, v) VALUES (1, 1) USING TIMESTAMP 3"))
+        self._replay_batchlogs()
+        node1.flush()
+        assert_one(
+            session,
+            "SELECT * FROM t_by_v",
+            [1, 1, None, None]
+        )
+
+        assert_one(
+            session,
+            "SELECT * FROM t",
+            [0, 0, 0]
+        )
+
+    @since('4.0')
+    def view_ttl_test_by_update(self):
+        """
+        Add mote tests that a materialized views properly TTLed via update query.
+        View row is alive as long as the corresponding base row exists, regardless update semantics.
+        @jira_ticket CASSANDRA-13127
+        """
+        session = self.prepare(rf=3, nodes=3)
+
+        session.execute('USE ks')
+
+        session.execute("CREATE TABLE t (a int, b int, c int, PRIMARY KEY(a, b))")
+        session.execute(("CREATE MATERIALIZED VIEW mv AS SELECT a, b FROM t "
+                         "WHERE a IS NOT NULL AND b IS NOT NULL PRIMARY KEY (b, a)"))
+
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        # Set initial values TTL = 3
+        session.execute("INSERT INTO t (a, b) VALUES (0, 0) USING TTL 3")
+        for node in self.cluster.nodelist():
+            node.flush()
+
+        # update normal column with greater TTL
+        # it should generate view updates
+        session.execute("UPDATE t USING TTL 1000 SET c = 0 WHERE a = 0 and b = 0;")
+        for node in self.cluster.nodelist():
+            node.flush()
+
+        debug('Wait for TTL(3) to expire')
+        time.sleep(3)
+
+        assert_one(
+            session,
+            "SELECT * FROM mv",
+            [0, 0]
+        )
+
     def view_tombstone_test(self):
         """
         Test that a materialized views properly tombstone
