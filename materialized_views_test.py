@@ -1710,7 +1710,6 @@ class TestMaterializedViews(Tester):
         for node in self.cluster.nodelist():
             node.nodetool("disableautocompaction")
 
-        # we create the base table with gc_grace_seconds=5 so batchlog will expire after 5 seconds
         session.execute("CREATE TABLE ks.t (pk int, ck1 int, ck2 int, v1 int, v2 int, PRIMARY KEY(pk, ck1, ck2))")
         session.execute(("CREATE MATERIALIZED VIEW ks.t_by_v AS SELECT * FROM t "
                          "WHERE pk IS NOT NULL AND ck1 IS NOT NULL AND ck2 IS NOT NULL "
@@ -1723,6 +1722,7 @@ class TestMaterializedViews(Tester):
         node3.stop(wait_other_notice=True)
 
         size = 50
+        range_deletion_ts = 30
         partition_deletion_ts = 10
 
         for ck1 in xrange(size):
@@ -1752,6 +1752,10 @@ class TestMaterializedViews(Tester):
                 elif ck1 == ck2 - 1:  # cell tombstone
                     session.execute("DELETE v2 FROM ks.t USING TIMESTAMP 70 WHERE pk=1 AND ck1={} AND ck2={}".format(ck1, ck2))
 
+        # range deletion
+        session.execute("DELETE FROM ks.t USING TIMESTAMP {} WHERE pk=1 and ck1 < 30 and ck1 > 20".format(range_deletion_ts))
+        session.execute("DELETE FROM ks.t USING TIMESTAMP {} WHERE pk=1 and ck1 = 20 and ck2 < 10".format(range_deletion_ts))
+
         # partition deletion for ck1 <= partition_deletion_ts
         session.execute("DELETE FROM ks.t USING TIMESTAMP {} WHERE pk=1".format(partition_deletion_ts))
         self._replay_batchlogs()
@@ -1768,23 +1772,37 @@ class TestMaterializedViews(Tester):
         node1.nodetool("repair ks t")
         self._replay_batchlogs()
 
-        for ck1 in xrange(size):
-            for ck2 in xrange(size):
-                if ck1 <= partition_deletion_ts or ck1 == ck2 or ck1 % 2 == 0:  # partition deletion or row deletion or range tombstone
-                    assert_none(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t_by_v WHERE pk=1 AND "
-                                         "ck1={} AND ck2={}".format(ck1, ck2))
-                    assert_none(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t WHERE pk=1 AND "
-                                         "ck1={} AND ck2={}".format(ck1, ck2))
-                elif ck1 == ck2 - 1:  # cell tombstone
-                    assert_one(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t_by_v WHERE pk=1 AND "
-                                        "ck1={} AND ck2={}".format(ck1, ck2), [1, ck1, ck2, ck1, None])
-                    assert_one(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t WHERE pk=1 AND "
-                                        "ck1={} AND ck2={}".format(ck1, ck2), [1, ck1, ck2, ck1, None])
-                else:
-                    assert_one(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t_by_v WHERE pk=1 AND "
-                                        "ck1={} AND ck2={}".format(ck1, ck2), [1, ck1, ck2, ck1, ck2])
-                    assert_one(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t WHERE pk=1 AND "
-                                        "ck1={} AND ck2={}".format(ck1, ck2), [1, ck1, ck2, ck1, ck2])
+        debug('stop cluter')
+        self.cluster.stop()
+
+        debug('rolling restart to check repaired data on each node')
+        for node in self.cluster.nodelist():
+            debug('starting {}'.format(node.name))
+            node.start(wait_other_notice=True, wait_for_binary_proto=True)
+            session = self.patient_cql_connection(node, consistency_level=ConsistencyLevel.ONE)
+            for ck1 in xrange(size):
+                for ck2 in xrange(size):
+                    if (
+                        ck1 <= partition_deletion_ts or  # partition deletion
+                        ck1 == ck2 or ck1 % 2 == 0 or  # row deletion or range tombstone
+                        (ck1 > 20 and ck1 < 30) or (ck1 == 20 and ck2 < 10)  # range tombstone
+                    ):
+                        assert_none(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t_by_v WHERE pk=1 AND "
+                                             "ck1={} AND ck2={}".format(ck1, ck2))
+                        assert_none(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t WHERE pk=1 AND "
+                                             "ck1={} AND ck2={}".format(ck1, ck2))
+                    elif ck1 == ck2 - 1:  # cell tombstone
+                        assert_one(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t_by_v WHERE pk=1 AND "
+                                            "ck1={} AND ck2={}".format(ck1, ck2), [1, ck1, ck2, ck1, None])
+                        assert_one(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t WHERE pk=1 AND "
+                                            "ck1={} AND ck2={}".format(ck1, ck2), [1, ck1, ck2, ck1, None])
+                    else:
+                        assert_one(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t_by_v WHERE pk=1 AND "
+                                            "ck1={} AND ck2={}".format(ck1, ck2), [1, ck1, ck2, ck1, ck2])
+                        assert_one(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t WHERE pk=1 AND "
+                                            "ck1={} AND ck2={}".format(ck1, ck2), [1, ck1, ck2, ck1, ck2])
+            debug('stopping {}'.format(node.name))
+            node.stop(wait_other_notice=True, wait_for_binary_proto=True)
 
     @attr('resource-intensive')
     def really_complex_repair_test(self):
