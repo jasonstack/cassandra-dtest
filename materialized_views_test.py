@@ -1035,6 +1035,22 @@ class TestMaterializedViews(Tester):
             assert_none(session, "SELECT * FROM t2")
             assert_none(session, "SELECT * FROM mv2")
 
+        # test with user-provided ttl
+        self.update_view(session, "INSERT INTO t2(k,a,b,c) VALUES(2,2,2,2) USING TTL 5", flush)
+        self.update_view(session, "UPDATE t2 USING TTL 100 SET c=1 WHERE k=2 AND a=2;", flush)
+        self.update_view(session, "UPDATE t2 USING TTL 50 SET c=2 WHERE k=2 AND a=2;", flush)
+        self.update_view(session, "DELETE c FROM t2 WHERE k=2 AND a=2;", flush)
+
+        time.sleep(5)
+
+        assert_none(session, "SELECT k,a,b,c FROM t2")
+        assert_none(session, "SELECT k,a,b FROM mv2")
+
+        if flush:
+            self.cluster.compact()
+            assert_none(session, "SELECT * FROM t2")
+            assert_none(session, "SELECT * FROM mv2")
+
         debug("MV with extra key")
         session.execute("CREATE TABLE t (k int PRIMARY KEY, a int, b int) with default_time_to_live=600")
         session.execute(("CREATE MATERIALIZED VIEW mv AS SELECT * FROM t "
@@ -1057,6 +1073,24 @@ class TestMaterializedViews(Tester):
             self.cluster.compact()
             assert_one(session, "SELECT * FROM t", [1, 3, 1])
             assert_one(session, "SELECT * FROM mv", [1, 3, 1])
+
+        # user provided ttl
+        self.update_view(session, "UPDATE t USING TTL 50 SET a = 4 WHERE k = 1", flush)
+        assert_one(session, "SELECT * FROM t", [1, 4, 1])
+        assert_one(session, "SELECT * FROM mv", [1, 4, 1])
+
+        self.update_view(session, "UPDATE t USING TTL 40 SET a = 5 WHERE k = 1", flush)
+        assert_one(session, "SELECT * FROM t", [1, 5, 1])
+        assert_one(session, "SELECT * FROM mv", [1, 5, 1])
+
+        self.update_view(session, "UPDATE t USING TTL 30 SET a = 6 WHERE k = 1", flush)
+        assert_one(session, "SELECT * FROM t", [1, 6, 1])
+        assert_one(session, "SELECT * FROM mv", [1, 6, 1])
+
+        if flush:
+            self.cluster.compact()
+            assert_one(session, "SELECT * FROM t", [1, 6, 1])
+            assert_one(session, "SELECT * FROM mv", [1, 6, 1])
 
     @since('3.0')
     def test_no_base_column_in_view_pk_complex_timestamp_with_flush(self):
