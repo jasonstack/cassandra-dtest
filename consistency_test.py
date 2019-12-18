@@ -955,6 +955,83 @@ class TestConsistency(Tester):
                    cl=ConsistencyLevel.ALL)
 
     @since('3.0')
+    def test_group_by_srp(self):
+        """
+        @jira_ticket reproduce SRP failed on group-by queries
+        """
+        cluster = self.cluster
+
+        # disable hinted handoff and set batch commit log so this doesn't interfere with the test
+        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+        cluster.set_batch_commitlog(enabled=True)
+
+        cluster.populate(2).start(wait_other_notice=True)
+        node1, node2 = cluster.nodelist()
+
+        session = self.patient_cql_connection(node1)
+
+        query = "CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};"
+        session.execute(query)
+
+        query = "CREATE TABLE test.test (pk int, ck int, PRIMARY KEY (pk, ck)) WITH READ_REPAIR='NONE';"
+        session.execute(query)
+
+        # with node2 down, populate data on node1
+        # node1:
+        #   key 1 : 1
+        #   key 0 : x
+        #   key 2 : 2
+
+        node2.stop(wait_other_notice=True)
+        session.execute('INSERT INTO test.test (pk, ck) VALUES (1, 1) USING TIMESTAMP 9;')
+        session.execute('DELETE FROM test.test USING TIMESTAMP 10 WHERE pk=0 AND ck=0;')
+        session.execute('INSERT INTO test.test (pk, ck) VALUES (2, 2) USING TIMESTAMP 9;')
+        node2.start(wait_other_notice=True, wait_for_binary_proto=True)
+
+        # with node1 down, populate data on node2
+        # node1:
+        #   key 1 : 1
+        #   key 0 : x
+        #   key 2 : 2
+        # node2:
+        #   key 1 : x
+        #   key 0 : 0
+        #   key 2 : x
+
+        session = self.patient_exclusive_cql_connection(node2)
+
+        node1.stop(wait_other_notice=True)
+        session.execute('DELETE FROM test.test USING TIMESTAMP 10 WHERE pk=1 AND ck=1;')
+        session.execute('INSERT INTO test.test (pk, ck) VALUES (0, 0) USING TIMESTAMP 9;')
+        session.execute('DELETE FROM test.test USING TIMESTAMP 10 WHERE pk=2 AND ck=2;')
+        node1.start(wait_other_notice=True, wait_for_binary_proto=True)
+
+        # pass
+        assert_none(session,
+                    'SELECT pk, ck FROM test.test limit 1;',
+                    cl=ConsistencyLevel.ALL)
+
+        # pass - group by pk limit 10
+        assert_none(session,
+                    'SELECT pk, ck FROM test.test GROUP BY pk limit 10;',
+                    cl=ConsistencyLevel.ALL)
+
+        # failed - group by pk limit 1
+        assert_none(session,
+                    'SELECT pk, ck FROM test.test GROUP BY pk limit 1;',
+                    cl=ConsistencyLevel.ALL)
+
+        # pass - group by pk,ck limit 10
+        assert_none(session,
+                    'SELECT pk, ck FROM test.test GROUP BY pk, ck limit 10;',
+                    cl=ConsistencyLevel.ALL)
+
+        # failed - group by pk,ck limit 1
+        assert_none(session,
+                    'SELECT pk, ck FROM test.test GROUP BY pk, ck limit 1;',
+                    cl=ConsistencyLevel.ALL)
+
+    @since('3.0')
     def test_13911(self):
         """
         @jira_ticket CASSANDRA-13911
